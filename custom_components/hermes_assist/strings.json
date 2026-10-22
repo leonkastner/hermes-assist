@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hermes Assist",
+        "description": "Address and key of the household ingress.",
+        "data": {"url": "URL (for example http://192.168.1.10:8808)", "key": "Assist key"}
+      }
+    },
+    "error": {"cannot_connect": "The household ingress did not answer."},
+    "abort": {"already_configured": "This ingress is already configured."}
+  }
+}
