@@ -85,6 +85,20 @@ class IngressTest(unittest.TestCase):
         self.assertEqual(req.headers["Authorization"], f"Bearer {API}")
         self.assertTrue(req.json["messages"][0]["content"].startswith("[Household member: Leon]\n"))
 
+    def test_time_line_is_berlin_with_weekday_and_dst(self):
+        from datetime import datetime, timezone
+        self.assertEqual(hi.time_line(datetime(2026, 10, 24, 9, 12, tzinfo=timezone.utc)),
+                         "[Current time: Saturday 2026-10-24 11:12 CEST (Europe/Berlin)]")
+        self.assertEqual(hi.time_line(datetime(2026, 12, 24, 9, 12, tzinfo=timezone.utc)),
+                         "[Current time: Thursday 2026-12-24 10:12 CET (Europe/Berlin)]")
+
+    def test_forwarded_message_carries_current_time_after_member_tag(self):
+        self.post("/v1/assist", {"text": "What time is it?", "conversation_id": "c1", "user_id": "uLeon"})
+        lines = self.fake.last.json["messages"][0]["content"].split("\n")
+        self.assertEqual(lines[0], "[Household member: Leon]")
+        self.assertTrue(lines[1].startswith("[Current time: ") and lines[1].endswith("(Europe/Berlin)]"))
+        self.assertEqual(lines[2], "What time is it?")
+
     def test_unknown_or_missing_user_refused(self):
         for uid in ("uStranger", None, ""):
             code, body = self.post("/v1/assist", {"text": "hi", "conversation_id": "c1", "user_id": uid, "language": "de"})
