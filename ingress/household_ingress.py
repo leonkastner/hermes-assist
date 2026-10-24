@@ -16,7 +16,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("household_ingress")
 
@@ -25,6 +27,19 @@ ASSIST_TIMEOUT = 170
 DELEGATE_TIMEOUT = 20 * 60
 REFUSAL = "This assistant only answers Leon and Alina."
 UNREACHABLE = "Sorry, I could not reach the household assistant right now. Please try again in a minute."
+
+
+TZ_NAME = "Europe/Berlin"
+
+
+def time_line(now: datetime | None = None) -> str:
+    """The api_server path gives the model no clock, so every forwarded message carries one."""
+    try:
+        local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(TZ_NAME))
+        return f"[Current time: {local:%A %Y-%m-%d %H:%M} {local.tzname()} ({TZ_NAME})]"
+    except Exception:  # no tzdata on the host: say so rather than guess Berlin
+        utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        return f"[Current time: {utc:%A %Y-%m-%d %H:%M} UTC]"
 
 
 def session_id(user_id: str, conversation_id: str) -> str:
@@ -81,7 +96,7 @@ def handle_assist(cfg: dict, body: dict) -> tuple[int, dict, str]:
         return 403, {"reply": REFUSAL}, "refused"
     sid = session_id(body["user_id"], str(body.get("conversation_id") or "default"))
     try:
-        reply = _call_hermes(cfg, f"[Household member: {name}]\n{text}", sid, ASSIST_TIMEOUT)
+        reply = _call_hermes(cfg, f"[Household member: {name}]\n{time_line()}\n{text}", sid, ASSIST_TIMEOUT)
     except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
         return 502, {"reply": UNREACHABLE}, name
     return 200, {"reply": reply}, name
