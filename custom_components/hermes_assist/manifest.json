@@ -3,10 +3,10 @@
   "name": "Hermes Assist",
   "codeowners": ["@leonkastner"],
   "config_flow": true,
-  "dependencies": ["conversation"],
+  "dependencies": ["conversation", "media_source"],
   "documentation": "https://github.com/leonkastner/hermes-assist",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/leonkastner/hermes-assist/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

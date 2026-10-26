@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -158,6 +159,68 @@ class IngressTest(unittest.TestCase):
         self.fake.stop()
         code, out = self.post("/v1/delegate", {"card_id": "t3", "title": "x", "body": ""}, key=DELEGATE)
         self.assertEqual((code, out["status"]), (502, "blocked"))
+
+    JPEG = base64.b64encode(b"\xff\xd8\xff\xe0" + b"0" * 20).decode()
+    PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 20).decode()
+
+    def test_assist_with_images_sends_multimodal(self):
+        images = [{"name": "a.jpg", "data": self.JPEG}, {"name": "b.png", "data": self.PNG}]
+        code, _ = self.post("/v1/assist", {"text": "Was ist das?", "user_id": "uLeon", "images": images})
+        self.assertEqual(code, 200)
+        content = self.fake.last.json["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertTrue(content[0]["text"].startswith("[Household member: Leon]\n[Current time: "))
+        self.assertIn("[Photos attached: a.jpg, b.png]\nWas ist das?", content[0]["text"])
+        self.assertEqual(content[1], {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + self.JPEG}})
+        self.assertEqual(content[2]["image_url"]["url"], "data:image/png;base64," + self.PNG)
+
+    def test_assist_image_limits(self):
+        img = {"name": "a.jpg", "data": self.JPEG}
+        bad = [
+            (413, [img] * 4),
+            (400, [{"name": "a.jpg", "data": "!!!notbase64"}]),
+            (400, [{"name": "a.jpg", "data": base64.b64encode(b"GIF89a....").decode()}]),
+            (400, [{"name": 5, "data": self.JPEG}]),
+            (400, "nope"),
+            (413, [{"name": "a.jpg", "data": "A" * (hi.MAX_IMAGE_B64 + 4)}]),
+        ]
+        for want, images in bad:
+            code, _ = self.post("/v1/assist", {"text": "hi", "user_id": "uLeon", "images": images})
+            self.assertEqual(code, want, images if want != 413 else want)
+        self.assertIsNone(self.fake.last)
+
+    def test_too_many_photos_message(self):
+        code, out = self.post("/v1/assist", {"text": "hi", "user_id": "uLeon",
+                                             "images": [{"name": "a.jpg", "data": self.JPEG}] * 4})
+        self.assertEqual((code, out["reply"]), (413, "Höchstens 3 Fotos pro Frage."))
+
+    def test_assist_body_over_limit_refused(self):
+        old, hi.MAX_ASSIST_BODY = hi.MAX_ASSIST_BODY, 5000
+        try:
+            code, _ = self.post("/v1/assist", {"text": "hi", "user_id": "uLeon",
+                                               "images": [{"name": "a.jpg", "data": "A" * 6000}]})
+        finally:
+            hi.MAX_ASSIST_BODY = old
+        self.assertEqual(code, 413)
+        self.assertIsNone(self.fake.last)
+
+    def test_text_only_unchanged(self):
+        self.post("/v1/assist", {"text": "hi", "user_id": "uLeon"})
+        self.assertIsInstance(self.fake.last.json["messages"][0]["content"], str)
+
+    def test_delegate_body_limit_unchanged(self):
+        code, _ = self.post("/v1/delegate", {"card_id": "t", "title": "x", "body": "y" * 90000}, key=DELEGATE)
+        self.assertEqual(code, 413)
+        self.assertIsNone(self.fake.last)
+
+    def test_log_line_counts_images(self):
+        with self.assertLogs("household_ingress", "INFO") as cm:
+            self.post("/v1/assist", {"text": "hi", "user_id": "uLeon", "images": [{"name": "a.jpg", "data": self.JPEG}]})
+            self.post("/v1/assist", {"text": "hi", "user_id": "uLeon"})
+        lines = [l for l in cm.output if "/v1/assist" in l]
+        self.assertIn("images=1", lines[0])
+        self.assertIn("images=0", lines[1])
 
 
 if __name__ == "__main__":
