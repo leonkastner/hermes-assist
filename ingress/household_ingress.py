@@ -7,6 +7,8 @@ Stdlib only. Config comes from the environment:
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -23,6 +25,10 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("household_ingress")
 
 MAX_TEXT = 20000
+MAX_IMAGES = 3
+MAX_IMAGE_B64 = 6_000_000
+MAX_ASSIST_BODY = MAX_IMAGES * MAX_IMAGE_B64 + MAX_TEXT * 4 + 4000
+TOO_MANY_IMAGES = f"Höchstens {MAX_IMAGES} Fotos pro Frage."
 ASSIST_TIMEOUT = 170
 DELEGATE_TIMEOUT = 20 * 60
 REFUSAL = "This assistant only answers Leon and Alina."
@@ -70,7 +76,7 @@ class Members:
             return self._data.get(user_id)
 
 
-def _call_hermes(cfg: dict, content: str, sid: str, timeout: float) -> str:
+def _call_hermes(cfg: dict, content: str | list, sid: str, timeout: float) -> str:
     body = json.dumps({"model": "household", "messages": [{"role": "user", "content": content}], "stream": False}).encode()
     req = urllib.request.Request(
         cfg["hermes_url"].rstrip("/") + "/v1/chat/completions", data=body, method="POST",
@@ -84,6 +90,31 @@ def _key_ok(header: str, key: str) -> bool:
     return bool(key) and hmac.compare_digest(header.encode(), f"Bearer {key}".encode())
 
 
+def _image_parts(images) -> tuple[list[dict], list[str]] | tuple[int, str]:
+    """Validated image_url parts and file names, or (status, message) when the list is refused."""
+    if not isinstance(images, list):
+        return 400, "Bad request."
+    if len(images) > MAX_IMAGES:
+        return 413, TOO_MANY_IMAGES
+    parts, names = [], []
+    for im in images:
+        name, data = (im.get("name"), im.get("data")) if isinstance(im, dict) else (None, None)
+        if not isinstance(name, str) or len(name) > 200 or not isinstance(data, str):
+            return 400, "Bad request."
+        if len(data) > MAX_IMAGE_B64:
+            return 413, "That photo is too large."
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return 400, "Bad request."
+        mime = "image/jpeg" if raw.startswith(b"\xff\xd8\xff") else "image/png" if raw.startswith(b"\x89PNG") else None
+        if not mime:
+            return 400, "Bad request."
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+        names.append(name)
+    return parts, names
+
+
 def handle_assist(cfg: dict, body: dict) -> tuple[int, dict, str]:
     """Returns (status, json, who) for POST /v1/assist."""
     text = body.get("text")
@@ -94,9 +125,20 @@ def handle_assist(cfg: dict, body: dict) -> tuple[int, dict, str]:
     name = cfg["members"].get(body.get("user_id"))
     if not name:
         return 403, {"reply": REFUSAL}, "refused"
+    parts, names = [], []
+    if body.get("images"):
+        checked = _image_parts(body["images"])
+        if isinstance(checked[0], int):
+            return checked[0], {"reply": checked[1]}, "bad"
+        parts, names = checked
     sid = session_id(body["user_id"], str(body.get("conversation_id") or "default"))
+    head = f"[Household member: {name}]\n{time_line()}\n"
+    if parts:
+        content = [{"type": "text", "text": f"{head}[Photos attached: {', '.join(names)}]\n{text}"}, *parts]
+    else:
+        content = head + text
     try:
-        reply = _call_hermes(cfg, f"[Household member: {name}]\n{time_line()}\n{text}", sid, ASSIST_TIMEOUT)
+        reply = _call_hermes(cfg, content, sid, ASSIST_TIMEOUT)
     except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
         return 502, {"reply": UNREACHABLE}, name
     return 200, {"reply": reply}, name
@@ -153,7 +195,7 @@ def make_handler(cfg: dict):
                 return self._send(401, {"ok": False})
             try:
                 n = int(self.headers.get("Content-Length", "0"))
-                if n > MAX_TEXT * 4 + 2000:
+                if n > (MAX_ASSIST_BODY if self.path == "/v1/assist" else MAX_TEXT * 4 + 2000):
                     return self._send(413, {"reply": "That message is too long."})
                 body = json.loads(self.rfile.read(n) or b"{}")
                 if not isinstance(body, dict):
@@ -161,7 +203,9 @@ def make_handler(cfg: dict):
             except ValueError:
                 return self._send(400, {"reply": "Bad request."})
             code, out, who = fn(cfg, body)
-            log.info("%s member=%s status=%d ms=%d", self.path, who, code, (time.time() - t0) * 1000)
+            imgs = body.get("images")
+            log.info("%s member=%s status=%d images=%d ms=%d", self.path, who, code,
+                     len(imgs) if isinstance(imgs, list) else 0, (time.time() - t0) * 1000)
             self._send(code, out)
 
     return Handler
