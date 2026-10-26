@@ -6,3 +6,5 @@ mutagen
 PyTurboJPEG
 numpy
 ha-ffmpeg
+wyoming
+httpx
