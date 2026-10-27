@@ -225,3 +225,152 @@ class IngressTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdminRoleTest(unittest.TestCase):
+    """Role file and single flight: the guard sees one role file, so an admin request runs alone."""
+
+    def setUp(self):
+        self.fake = FakeHermes()
+        self.dir = tempfile.TemporaryDirectory()
+        members = os.path.join(self.dir.name, "members.json")
+        with open(members, "w") as f:
+            json.dump({"uLeon": "Leon", "uAlina": "Alina"}, f)
+        self.role = os.path.join(self.dir.name, "role.json")
+        os.environ.update(ASSIST_KEY=ASSIST, API_SERVER_KEY=API, DELEGATE_KEY=DELEGATE, ADMIN_IDS="uLeon",
+                          ROLE_FILE=self.role, HERMES_URL=f"http://127.0.0.1:{self.fake.port}", MEMBERS_FILE=members)
+        self.seen = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):  # records the role file at the moment Hermes is called
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers["Content-Length"])
+                body = json.loads(self.rfile.read(n))
+                try:
+                    with open(outer.role) as f:
+                        role = json.load(f)
+                except (OSError, ValueError):
+                    role = None
+                outer.seen.append((body["messages"][0]["content"], role))
+                if outer.hold:
+                    outer.hold.wait(5)
+                data = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.hold = None
+        self.fake.stop()
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        os.environ["HERMES_URL"] = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        self.cfg = hi.load_cfg()
+        self.servers = hi.serve(self.cfg, ["127.0.0.1"], 0)
+        self.port = self.servers[0].server_address[1]
+
+    def tearDown(self):
+        for s in self.servers:
+            s.shutdown()
+            s.server_close()
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.dir.cleanup()
+        os.environ.pop("ADMIN_IDS", None)
+        os.environ.pop("ROLE_FILE", None)
+
+    def ask(self, user, text="hi"):
+        return post(self.port, "/v1/assist", {"text": text, "conversation_id": "c", "user_id": user}, ASSIST)
+
+    def test_admin_request_writes_role_file_then_removes_it(self):
+        code, _ = self.ask("uLeon")
+        self.assertEqual(code, 200)
+        content, role = self.seen[0]
+        self.assertEqual(role["role"], "admin")
+        self.assertTrue(0 < role["expires"] - time.time() <= hi.ASSIST_TIMEOUT + hi.ROLE_MARGIN)
+        self.assertIn("[Access: admin.", content)
+        self.assertFalse(os.path.exists(self.role))
+        self.assertEqual(os.stat(self.dir.name).st_mode & 0o022, 0)
+
+    def test_other_member_never_gets_role_file_or_line(self):
+        self.ask("uAlina")
+        content, role = self.seen[0]
+        self.assertIsNone(role)
+        self.assertNotIn("[Access:", content)
+
+    def test_role_file_removed_when_hermes_fails(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        code, _ = self.ask("uLeon")
+        self.assertEqual(code, 502)
+        self.assertFalse(os.path.exists(self.role))
+        self.assertEqual(self.cfg["flight"]._active, 0)
+
+    def test_nobody_is_admin_without_admin_ids(self):
+        os.environ["ADMIN_IDS"] = ""
+        cfg = hi.load_cfg()
+        self.assertIsNone(cfg["roles"].path)
+        self.assertEqual(cfg["admin_ids"], set())
+
+    def test_stale_role_file_removed_at_start(self):
+        with open(self.role, "w") as f:
+            f.write("{}")
+        hi.load_cfg()
+        self.assertFalse(os.path.exists(self.role))
+
+    def test_admin_runs_alone_other_member_waits(self):
+        self.hold = threading.Event()
+        results = {}
+        t1 = threading.Thread(target=lambda: results.setdefault("leon", self.ask("uLeon")))
+        t1.start()
+        deadline = time.time() + 5
+        while not self.seen and time.time() < deadline:
+            time.sleep(0.01)
+        t2 = threading.Thread(target=lambda: results.setdefault("alina", self.ask("uAlina")))
+        t2.start()
+        time.sleep(0.3)
+        self.assertEqual(len(self.seen), 1)       # Alina's request has not reached Hermes while Leon's runs
+        self.hold.set()
+        t1.join(5)
+        t2.join(5)
+        self.assertEqual([c for c, _ in self.seen if "Alina" in c and "[Access:" in c], [])
+        self.assertEqual(self.seen[1][1], None)   # Alina ran after the file was removed
+        self.assertEqual(results["leon"][0], 200)
+        self.assertEqual(results["alina"][0], 200)
+
+    def test_admin_downgraded_while_another_request_runs(self):
+        flight = hi.Flight()
+        self.assertEqual(flight.enter(False), "member")
+        self.assertEqual(flight.enter(True, admin_wait=0.05), "member")   # could not run alone
+        flight.leave("member")
+        flight.leave("member")
+        self.assertEqual(flight.enter(True), "admin")
+        flight.leave("admin")
+
+    def test_member_gets_busy_when_admin_does_not_finish(self):
+        flight = hi.Flight()
+        self.assertEqual(flight.enter(True), "admin")
+        self.assertIsNone(flight.enter(False, member_wait=0.05))
+        flight.leave("admin")
+
+    def test_delegation_waits_for_admin_and_never_runs_as_admin(self):
+        flight = self.cfg["flight"]
+        self.assertEqual(flight.enter(True), "admin")
+        self.cfg["delegate_wait"] = 0.05
+        code, out, _ = hi.handle_delegate(self.cfg, {"card_id": "c1", "title": "t"})
+        self.assertEqual(code, 503)
+        flight.leave("admin")
+        code, out, _ = hi.handle_delegate(self.cfg, {"card_id": "c1", "title": "t"})
+        self.assertEqual(code, 200)
+        self.assertIsNone(self.seen[-1][1])
+
+    def test_unwritable_role_dir_runs_as_member(self):
+        self.cfg["roles"].path = os.path.join(self.dir.name, "missing-dir", "role.json")
+        code, _ = self.ask("uLeon")
+        self.assertEqual(code, 200)
+        content, role = self.seen[0]
+        self.assertNotIn("[Access: admin", content)
+        self.assertIn("[Access: standard.", content)
