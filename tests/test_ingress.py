@@ -374,3 +374,61 @@ class AdminRoleTest(unittest.TestCase):
         content, role = self.seen[0]
         self.assertNotIn("[Access: admin", content)
         self.assertIn("[Access: standard.", content)
+
+
+class QuarantineTest(unittest.TestCase):
+    """A request that ends without a reply may still be running inside Hermes: no admin until the quarantine passes."""
+
+    def test_no_admin_during_quarantine_then_admin_again(self):
+        now = [100.0]
+        flight = hi.Flight(clock=lambda: now[0])
+        flight.taint(900)
+        self.assertEqual(flight.enter(True, admin_wait=0.01), "member")
+        flight.leave("member")
+        now[0] += 899
+        self.assertEqual(flight.enter(True, admin_wait=0.01), "member")
+        flight.leave("member")
+        now[0] += 2
+        self.assertEqual(flight.enter(True), "admin")
+        flight.leave("admin")
+
+    def test_quarantine_set_while_admin_waits(self):
+        now = [0.0]
+        flight = hi.Flight(clock=lambda: now[0])
+        self.assertEqual(flight.enter(False), "member")
+        t = threading.Thread(target=lambda: flight.taint(900))
+        t.start()
+        t.join()
+        flight.leave("member")                       # the failed request is gone, but its run may not be
+        self.assertEqual(flight.enter(True, admin_wait=0.01), "member")
+
+    def test_taint_never_shortens(self):
+        now = [0.0]
+        flight = hi.Flight(clock=lambda: now[0])
+        flight.taint(900)
+        flight.taint(10)
+        now[0] = 500
+        self.assertEqual(flight.enter(True, admin_wait=0.01), "member")
+
+    def test_failed_requests_start_the_quarantine(self):
+        # a Hermes that is down, for a member and for an admin request, and a failed delegation
+        d = tempfile.TemporaryDirectory()
+        members = os.path.join(d.name, "m.json")
+        with open(members, "w") as f:
+            json.dump({"uLeon": "Leon", "uAlina": "Alina"}, f)
+        os.environ.update(ASSIST_KEY=ASSIST, API_SERVER_KEY=API, DELEGATE_KEY=DELEGATE, ADMIN_IDS="uLeon",
+                          ROLE_FILE=os.path.join(d.name, "role.json"), MEMBERS_FILE=members, HERMES_URL="http://127.0.0.1:9")
+        try:
+            for who in ("uAlina", "uLeon"):
+                cfg = hi.load_cfg()
+                code, _, _ = hi.handle_assist(cfg, {"text": "hi", "user_id": who})
+                self.assertEqual(code, 502)
+                self.assertEqual(cfg["flight"].enter(True, admin_wait=0.01), "member", who)
+            cfg = hi.load_cfg()
+            code, _, _ = hi.handle_delegate(cfg, {"card_id": "c", "title": "t"})
+            self.assertEqual(code, 502)
+            self.assertEqual(cfg["flight"].enter(True, admin_wait=0.01), "member")
+        finally:
+            os.environ.pop("ADMIN_IDS", None)
+            os.environ.pop("ROLE_FILE", None)
+            d.cleanup()
