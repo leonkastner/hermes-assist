@@ -4,6 +4,8 @@
 Stdlib only. Config comes from the environment:
   ASSIST_KEY, API_SERVER_KEY, HERMES_URL, MEMBERS_FILE, BIND (comma list), PORT
   DELEGATE_KEY (optional; enables /v1/delegate)
+  ADMIN_IDS (comma list of Home Assistant user ids that may use admin rights) and ROLE_FILE (default
+  /run/household-role/role.json): without both, nobody is admin
 """
 from __future__ import annotations
 
@@ -36,6 +38,13 @@ UNREACHABLE = "Sorry, I could not reach the household assistant right now. Pleas
 
 
 TZ_NAME = "Europe/Berlin"
+ADMIN_WAIT = 10        # seconds an admin request waits for other requests to finish before it runs as a member
+MEMBER_WAIT = 25       # seconds any other request waits for an admin request to finish
+ROLE_MARGIN = 30       # the role file outlives the request timeout by this much
+BUSY = "The household assistant is busy with another request. Please try again in a minute."
+ADMIN_LINE = "[Access: admin. Leon's own admin rights are on for this message only.]\n"
+NO_ADMIN_LINE = ("[Access: standard. Admin rights are not available for this message because another request was "
+                 "running. If the task needs them, tell Leon to ask again in a minute.]\n")
 
 
 def time_line(now: datetime | None = None) -> str:
@@ -50,6 +59,57 @@ def time_line(now: datetime | None = None) -> str:
 
 def session_id(user_id: str, conversation_id: str) -> str:
     return "assist-" + hashlib.sha256(f"{user_id}:{conversation_id}".encode()).hexdigest()[:24]
+
+
+class Flight:
+    """Which requests are in flight. The guard sees one role file, so an admin request must run alone: it waits for
+    the others to finish, and while it runs every other request (members, delegation) waits for it."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._active = 0
+        self._admin = False
+
+    def enter(self, want_admin: bool, admin_wait: float = ADMIN_WAIT, member_wait: float = MEMBER_WAIT) -> str | None:
+        """Returns "admin", "member", or None (busy: an admin request did not finish within member_wait)."""
+        with self._cv:
+            if want_admin:
+                if self._cv.wait_for(lambda: self._active == 0 and not self._admin, admin_wait):
+                    self._admin = True
+                    self._active = 1
+                    return "admin"
+            if not self._cv.wait_for(lambda: not self._admin, member_wait):
+                return None
+            self._active += 1
+            return "member"
+
+    def leave(self, role: str) -> None:
+        with self._cv:
+            if role == "admin":
+                self._admin = False
+            self._active -= 1
+            self._cv.notify_all()
+
+
+class RoleFile:
+    """The role of the request in flight, for ha-guard. Written atomically, removed when the request ends."""
+
+    def __init__(self, path: str | None) -> None:
+        self.path = path
+
+    def set_admin(self, ttl: float) -> None:
+        d = os.path.dirname(self.path)
+        tmp = os.path.join(d, f".role.{os.getpid()}.{threading.get_ident()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump({"role": "admin", "expires": time.time() + ttl}, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, self.path)
+
+    def clear(self) -> None:
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
 
 
 class Members:
@@ -133,15 +193,35 @@ def handle_assist(cfg: dict, body: dict) -> tuple[int, dict, str]:
         parts, names = checked
     sid = session_id(body["user_id"], str(body.get("conversation_id") or "default"))
     head = f"[Household member: {name}]\n{time_line()}\n"
-    if parts:
-        content = [{"type": "text", "text": f"{head}[Photos attached: {', '.join(names)}]\n{text}"}, *parts]
-    else:
-        content = head + text
+    flight, roles = cfg["flight"], cfg["roles"]
+    want_admin = body["user_id"] in cfg["admin_ids"] and roles.path is not None
+    role = flight.enter(want_admin)
+    if role is None:
+        return 503, {"reply": BUSY}, name
     try:
-        reply = _call_hermes(cfg, content, sid, ASSIST_TIMEOUT)
-    except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
-        return 502, {"reply": UNREACHABLE}, name
-    return 200, {"reply": reply}, name
+        if role == "admin":
+            try:
+                roles.set_admin(ASSIST_TIMEOUT + ROLE_MARGIN)
+            except OSError:
+                log.exception("role file not writable; running as member")
+                role = "member"
+        if role == "admin":
+            head += ADMIN_LINE
+        elif want_admin:
+            head += NO_ADMIN_LINE
+        if parts:
+            content = [{"type": "text", "text": f"{head}[Photos attached: {', '.join(names)}]\n{text}"}, *parts]
+        else:
+            content = head + text
+        try:
+            reply = _call_hermes(cfg, content, sid, ASSIST_TIMEOUT)
+        except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
+            return 502, {"reply": UNREACHABLE}, name
+        return 200, {"reply": reply}, f"{name}{' admin' if role == 'admin' else ''}"
+    finally:
+        if role == "admin":
+            roles.clear()
+        flight.leave(role)
 
 
 def handle_delegate(cfg: dict, body: dict) -> tuple[int, dict, str]:
@@ -149,10 +229,15 @@ def handle_delegate(cfg: dict, body: dict) -> tuple[int, dict, str]:
     if not card or not title:
         return 400, {"status": "blocked", "text": "card_id and title are required"}, "bad"
     content = f"[Delegated task from Leon's personal assistant, card {card}]\n{title}\n\n{body.get('body') or ''}"
+    role = cfg["flight"].enter(False, member_wait=cfg.get("delegate_wait", DELEGATE_TIMEOUT))
+    if role is None:
+        return 503, {"status": "blocked", "text": BUSY}, "delegate"
     try:
         reply = _call_hermes(cfg, content, f"card-{card}", cfg.get("delegate_timeout", DELEGATE_TIMEOUT))
     except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
         return 502, {"status": "blocked", "text": "household assistant unreachable"}, "delegate"
+    finally:
+        cfg["flight"].leave(role)
     first = reply.lstrip().split("\n", 1)[0]
     status = "blocked" if first.startswith("BLOCKED:") else "done"
     return 200, {"status": status, "text": reply}, "delegate"
@@ -233,8 +318,13 @@ def load_cfg() -> _Cfg:
         def get(self, user_id):
             return members.get(user_id)
 
+    admin_ids = {i.strip() for i in e.get("ADMIN_IDS", "").split(",") if i.strip()}
+    roles = RoleFile(e.get("ROLE_FILE", "/run/household-role/role.json") if admin_ids else None)
+    if roles.path:
+        roles.clear()  # a file left by a crash must not outlive the process that wrote it
     return _Cfg(assist_key=e["ASSIST_KEY"], api_key=e["API_SERVER_KEY"], delegate_key=e.get("DELEGATE_KEY", ""),
-                hermes_url=e.get("HERMES_URL", "http://127.0.0.1:8809"), members=MembersView())
+                hermes_url=e.get("HERMES_URL", "http://127.0.0.1:8809"), members=MembersView(),
+                admin_ids=admin_ids, roles=roles, flight=Flight())
 
 
 def main() -> None:
