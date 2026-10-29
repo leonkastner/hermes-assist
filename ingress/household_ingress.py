@@ -239,7 +239,8 @@ def handle_delegate(cfg: dict, body: dict) -> tuple[int, dict, str]:
     card, title = str(body.get("card_id") or ""), str(body.get("title") or "")
     if not card or not title:
         return 400, {"status": "blocked", "text": "card_id and title are required"}, "bad"
-    content = f"[Delegated task from Leon's personal assistant, card {card}]\n{title}\n\n{body.get('body') or ''}"
+    content = (f"[Delegated task from Leon's personal assistant, card {card}]\n{time_line()}\n"
+               f"{title}\n\n{body.get('body') or ''}")
     role = cfg["flight"].enter(False, member_wait=cfg.get("delegate_wait", DELEGATE_TIMEOUT))
     if role is None:
         return 503, {"status": "blocked", "text": BUSY}, "delegate"
