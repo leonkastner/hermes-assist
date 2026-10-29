@@ -147,8 +147,11 @@ class IngressTest(unittest.TestCase):
         code, out = self.post("/v1/delegate", body, key=DELEGATE)
         self.assertEqual((code, out["status"]), (200, "done"))
         self.assertEqual(self.fake.last.headers["X-Hermes-Session-Id"], "card-t1")
-        self.assertTrue(self.fake.last.json["messages"][0]["content"].startswith(
-            "[Delegated task from Leon's personal assistant, card t1]\nPlan dinner\n\n3 days"))
+        content = self.fake.last.json["messages"][0]["content"]
+        head, clock, rest = content.split("\n", 2)
+        self.assertEqual(head, "[Delegated task from Leon's personal assistant, card t1]")
+        self.assertRegex(clock, r"^\[Current time: \w+ \d{4}-\d{2}-\d{2} \d{2}:\d{2} \w+ \(Europe/Berlin\)\]$")
+        self.assertEqual(rest, "Plan dinner\n\n3 days")
 
     def test_delegate_blocked_prefix(self):
         self.fake.reply = "BLOCKED: I cannot read mail."
