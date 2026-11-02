@@ -239,18 +239,35 @@ def handle_delegate(cfg: dict, body: dict) -> tuple[int, dict, str]:
     card, title = str(body.get("card_id") or ""), str(body.get("title") or "")
     if not card or not title:
         return 400, {"status": "blocked", "text": "card_id and title are required"}, "bad"
-    content = (f"[Delegated task from Leon's personal assistant, card {card}]\n{time_line()}\n"
-               f"{title}\n\n{body.get('body') or ''}")
-    role = cfg["flight"].enter(False, member_wait=cfg.get("delegate_wait", DELEGATE_TIMEOUT))
+    head = f"[Delegated task from Leon's personal assistant, card {card}]\n{time_line()}\n"
+    flight, roles = cfg["flight"], cfg["roles"]
+    # Cards come from Leon's personal assistant, which only Leon reaches, so they carry his admin rights.
+    want_admin = roles.path is not None
+    wait = cfg.get("delegate_wait", DELEGATE_TIMEOUT)
+    role = flight.enter(want_admin, admin_wait=wait, member_wait=wait)
     if role is None:
         return 503, {"status": "blocked", "text": BUSY}, "delegate"
     try:
-        reply = _call_hermes(cfg, content, f"card-{card}", cfg.get("delegate_timeout", DELEGATE_TIMEOUT))
-    except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
-        cfg["flight"].taint()
-        return 502, {"status": "blocked", "text": "household assistant unreachable"}, "delegate"
+        if role == "admin":
+            try:
+                roles.set_admin(cfg.get("delegate_timeout", DELEGATE_TIMEOUT) + ROLE_MARGIN)
+            except OSError:
+                log.exception("role file not writable; running as member")
+                role = "member"
+        if role == "admin":
+            head += ADMIN_LINE
+        elif want_admin:
+            head += NO_ADMIN_LINE
+        content = f"{head}{title}\n\n{body.get('body') or ''}"
+        try:
+            reply = _call_hermes(cfg, content, f"card-{card}", cfg.get("delegate_timeout", DELEGATE_TIMEOUT))
+        except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
+            flight.taint()
+            return 502, {"status": "blocked", "text": "household assistant unreachable"}, "delegate"
     finally:
-        cfg["flight"].leave(role)
+        if role == "admin":
+            roles.clear()
+        flight.leave(role)
     first = reply.lstrip().split("\n", 1)[0]
     status = "blocked" if first.startswith("BLOCKED:") else "done"
     return 200, {"status": status, "text": reply}, "delegate"

@@ -359,7 +359,8 @@ class AdminRoleTest(unittest.TestCase):
         self.assertIsNone(flight.enter(False, member_wait=0.05))
         flight.leave("admin")
 
-    def test_delegation_waits_for_admin_and_never_runs_as_admin(self):
+    def test_delegation_waits_for_admin_and_runs_as_admin(self):
+        # Cards come from Leon's personal assistant, which only Leon reaches: they carry his admin rights.
         flight = self.cfg["flight"]
         self.assertEqual(flight.enter(True), "admin")
         self.cfg["delegate_wait"] = 0.05
@@ -368,7 +369,18 @@ class AdminRoleTest(unittest.TestCase):
         flight.leave("admin")
         code, out, _ = hi.handle_delegate(self.cfg, {"card_id": "c1", "title": "t"})
         self.assertEqual(code, 200)
-        self.assertIsNone(self.seen[-1][1])
+        content, role = self.seen[-1]
+        self.assertEqual(role["role"], "admin")
+        self.assertIn("[Access: admin.", content)
+        self.assertFalse(os.path.exists(self.role))
+
+    def test_delegation_is_member_without_admin_setup(self):
+        self.cfg["roles"].path = None
+        code, _, _ = hi.handle_delegate(self.cfg, {"card_id": "c1", "title": "t"})
+        self.assertEqual(code, 200)
+        content, role = self.seen[-1]
+        self.assertIsNone(role)
+        self.assertNotIn("[Access: admin", content)
 
     def test_unwritable_role_dir_runs_as_member(self):
         self.cfg["roles"].path = os.path.join(self.dir.name, "missing-dir", "role.json")
