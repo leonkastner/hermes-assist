@@ -40,6 +40,7 @@ UNREACHABLE = "Sorry, I could not reach the household assistant right now. Pleas
 TZ_NAME = "Europe/Berlin"
 ADMIN_WAIT = 10        # seconds an admin request waits for other requests to finish before it runs as a member
 MEMBER_WAIT = 25       # seconds any other request waits for an admin request to finish
+GUARD_MAX_TTL = 590     # ha-guard treats a role file that expires more than 600 s ahead as invalid (member)
 ROLE_MARGIN = 30       # the role file outlives the request timeout by this much
 QUARANTINE_S = 900     # after a request ends without a reply, Hermes may still be running it: no admin until this passes
 BUSY = "The household assistant is busy with another request. Please try again in a minute."
@@ -250,7 +251,7 @@ def handle_delegate(cfg: dict, body: dict) -> tuple[int, dict, str]:
     try:
         if role == "admin":
             try:
-                roles.set_admin(cfg.get("delegate_timeout", DELEGATE_TIMEOUT) + ROLE_MARGIN)
+                roles.set_admin(min(cfg.get("delegate_timeout", DELEGATE_TIMEOUT) + ROLE_MARGIN, GUARD_MAX_TTL))
             except OSError:
                 log.exception("role file not writable; running as member")
                 role = "member"

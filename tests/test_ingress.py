@@ -371,6 +371,8 @@ class AdminRoleTest(unittest.TestCase):
         self.assertEqual(code, 200)
         content, role = self.seen[-1]
         self.assertEqual(role["role"], "admin")
+        # ha-guard rejects a role file that expires more than 10 minutes ahead (MAX_TTL_S = 600): stay under it
+        self.assertTrue(0 < role["expires"] - time.time() <= hi.GUARD_MAX_TTL)
         self.assertIn("[Access: admin.", content)
         self.assertFalse(os.path.exists(self.role))
 
