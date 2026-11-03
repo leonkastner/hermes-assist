@@ -17,6 +17,9 @@ from .const import CONF_KEY, CONF_URL
 
 _LOGGER = logging.getLogger(__name__)
 
+READ_TIMEOUT_S = 170  # a real answer can take minutes
+CONNECT_TIMEOUT_S = 10  # an unreachable box must fail in seconds
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     async_add_entities([HermesAssistEntity(entry)])
@@ -51,7 +54,7 @@ class HermesAssistEntity(conversation.ConversationEntity):
                 f"{self.entry.data[CONF_URL]}/v1/assist",
                 json=payload,
                 headers={"Authorization": f"Bearer {self.entry.data[CONF_KEY]}"},
-                timeout=aiohttp.ClientTimeout(total=170),
+                timeout=aiohttp.ClientTimeout(total=READ_TIMEOUT_S, connect=CONNECT_TIMEOUT_S, sock_connect=CONNECT_TIMEOUT_S),
             ) as resp:
                 reply = (await resp.json()).get("reply") or "The household assistant sent no answer."
                 sent_ok = resp.status == 200

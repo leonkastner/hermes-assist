@@ -109,3 +109,22 @@ async def test_notes_are_prepended_to_text(hass, aioclient_mock, tmp_path):
     payload = aioclient_mock.mock_calls[0][2]
     assert payload["text"].startswith("Foto x.heic") and payload["text"].endswith("Frage")
     assert "images" not in payload
+
+
+async def test_connect_timeout_short_read_timeout_long(hass, aioclient_mock, monkeypatch):
+    import aiohttp
+    from custom_components.hermes_assist import conversation as mod
+    seen = []
+    real = aiohttp.ClientTimeout
+    monkeypatch.setattr(mod.aiohttp, "ClientTimeout", lambda **kw: seen.append(kw) or real(**kw))
+    aioclient_mock.post(f"{URL}/v1/assist", json={"reply": "ok"})
+    entity_id = await _setup(hass)
+    await conversation.async_converse(hass, "hi", None, Context(), agent_id=entity_id)
+    assert seen == [{"total": 170, "connect": 10, "sock_connect": 10}]
+
+
+async def test_unreachable_box_gets_not_reachable_reply(hass, aioclient_mock):
+    aioclient_mock.post(f"{URL}/v1/assist", exc=TimeoutError())
+    entity_id = await _setup(hass)
+    result = await conversation.async_converse(hass, "hi", None, Context(), agent_id=entity_id)
+    assert "not reachable" in result.response.speech["plain"]["speech"]
